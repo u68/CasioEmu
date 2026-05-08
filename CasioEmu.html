@@ -34,18 +34,14 @@
         <button id="toggleToolsBtn" style="background:transparent;border:none;color:#fff;padding:0px 4px;font-size:16px;cursor:pointer;line-height:1;">▲</button>
       </div>
       <div id="web-tools-body" style="pointer-events:auto;">
-        <div style="margin-bottom:8px;font-size:12px;line-height:1.4;color:#ccc;">Browse directories, edit files, rename, move, delete, and upload into the current folder. Models live under <code style="color:#fff;">/models</code>.</div>
         <div id="breadcrumb" style="margin-bottom:8px;font-size:12px;color:#9ad;word-break:break-all;"></div>
         <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">
           <button id="upBtn">Up</button>
-          <button id="refreshBtn">Refresh</button>
           <button id="openBtn">Open</button>
           <button id="newFolderBtn">New Folder</button>
           <button id="renameBtn">Rename</button>
-          <button id="moveBtn">Move</button>
           <button id="deleteBtn">Delete</button>
           <button id="downloadBtn">Download</button>
-          <button id="loadLocalesBtn">Load locales</button>
         </div>
         <div style="display:flex;gap:6px;margin-bottom:8px;">
           <input id="uploadCurrent" type="file" multiple style="flex:1;padding:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;" />
@@ -735,10 +731,6 @@
           goUpDirectory();
           releaseCalculatorFocus();
         });
-        document.getElementById('refreshBtn').addEventListener('click', function() {
-          populateModelsList();
-          releaseCalculatorFocus();
-        });
         document.getElementById('openBtn').addEventListener('click', function() {
           openSelected();
           releaseCalculatorFocus();
@@ -751,20 +743,12 @@
           renameSelected();
           releaseCalculatorFocus();
         });
-        document.getElementById('moveBtn').addEventListener('click', function() {
-          moveSelected();
-          releaseCalculatorFocus();
-        });
         document.getElementById('deleteBtn').addEventListener('click', function() {
           deleteSelected();
           releaseCalculatorFocus();
         });
         document.getElementById('downloadBtn').addEventListener('click', function() {
           downloadSelected();
-          releaseCalculatorFocus();
-        });
-        document.getElementById('loadLocalesBtn').addEventListener('click', function() {
-          loadLocales();
           releaseCalculatorFocus();
         });
 
