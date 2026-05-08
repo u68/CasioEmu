@@ -1,0 +1,853 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>CasioEmu</title>
+    <style>
+      html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #111;
+      }
+
+      #canvas {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100vw;
+        height: 100vh;
+        display: block;
+        background: #000;
+        z-index: 1;
+      }
+
+      /* calculator overlay removed for single-window split UI */
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+    <div id="web-tools" style="position:fixed;right:8px;top:8px;z-index:9999;background:rgba(0,0,0,0.7);padding:10px;color:#fff;font-family:sans-serif;min-width:10px;max-width:420px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;">
+        <strong style="font-size:13px;" id="toolsTitle">File Manager</strong>
+        <button id="toggleToolsBtn" style="background:transparent;border:none;color:#fff;padding:0px 4px;font-size:16px;cursor:pointer;line-height:1;">▲</button>
+      </div>
+      <div id="web-tools-body" style="pointer-events:auto;">
+        <div style="margin-bottom:8px;font-size:12px;line-height:1.4;color:#ccc;">Browse directories, edit files, rename, move, delete, and upload into the current folder. Models live under <code style="color:#fff;">/models</code>.</div>
+        <div id="breadcrumb" style="margin-bottom:8px;font-size:12px;color:#9ad;word-break:break-all;"></div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">
+          <button id="upBtn">Up</button>
+          <button id="refreshBtn">Refresh</button>
+          <button id="openBtn">Open</button>
+          <button id="newFolderBtn">New Folder</button>
+          <button id="renameBtn">Rename</button>
+          <button id="moveBtn">Move</button>
+          <button id="deleteBtn">Delete</button>
+          <button id="downloadBtn">Download</button>
+          <button id="loadLocalesBtn">Load locales</button>
+        </div>
+        <div style="display:flex;gap:6px;margin-bottom:8px;">
+          <input id="uploadCurrent" type="file" multiple style="flex:1;padding:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.05);color:#fff;" />
+        </div>
+        <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap;">
+          <input id="uploadFolder" type="file" webkitdirectory directory multiple style="display:none;" />
+          <button id="btnUploadFolder">Upload Folder</button>
+          <input id="uploadModelsFolder" type="file" webkitdirectory directory multiple style="display:none;" />
+          <button id="btnUploadModels">Upload Models Folder</button>
+        </div>
+        <select id="modelsList" size="10" style="width:100%;display:block;margin-bottom:8px;padding:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.85);color:#fff;"></select>
+        <textarea id="fileEditor" style="display:none;width:100%;height:180px;margin-bottom:8px;padding:8px;border:1px solid rgba(255,255,255,0.15);background:#111;color:#fff;font-family:monospace;font-size:12px;"></textarea>
+        <div id="web-tools-msg" style="min-height:18px;font-size:12px;color:#ddd"></div>
+      </div>
+    </div>
+    <script>
+      // Throttle the wasm event loop to let the browser render (16ms ~ 60fps)
+      var originalSetTimeout = window.setTimeout;
+      var lastFrameTime = performance.now();
+      window.setTimeout = function(callback, delay) {
+        if (delay === 0) {
+          var now = performance.now();
+          var timeSinceLastFrame = now - lastFrameTime;
+          if (timeSinceLastFrame < 16) {
+            delay = Math.max(1, 16 - timeSinceLastFrame);
+          }
+          lastFrameTime = now;
+        }
+        return originalSetTimeout(callback, delay);
+      };
+
+      async function fetchAndRestoreFileSync(url, targetPath) {
+        try {
+          const res = await fetch(url);
+          if (!res.ok) return false;
+          const buffer = new Uint8Array(await res.arrayBuffer());
+          const fs = getFs(); if (!fs) return false;
+          try { fs.writeFile(targetPath, buffer); } catch (e) { console.warn('Write error:', e); return false; }
+          return true;
+        } catch (e) {
+          return false;
+        }
+      }
+      
+      var Module = {
+        canvas: document.getElementById("canvas"),
+        locateFile: function (path) {
+          return path;
+        },
+        preRun: [],
+        onRuntimeInitialized: undefined // Will be set after script load
+      };
+
+      // Expose a simple WebSyncFS shim so native code can call Module._WebSyncFS()
+      Module._WebSyncFS = function() {
+        try { syncPersistentFs('native-request'); } catch(e) { console.warn('WebSyncFS shim error', e); }
+      };
+
+      function initializePersistentFsPreRun() {
+        console.log('[preRun] Initializing persistent filesystem');
+        if (typeof FS === 'undefined' || typeof IDBFS === 'undefined') {
+          console.warn('[preRun] FS or IDBFS not available');
+          return;
+        }
+
+        const dependencyId = 'web-idbfs-init';
+        if (typeof addRunDependency === 'function') {
+          addRunDependency(dependencyId);
+        }
+
+        try {
+          try { FS.mkdir('/models'); } catch (e) {}
+          try { FS.mount(IDBFS, {}, '/models'); } catch (e) {}
+
+          try { FS.mkdir('/locales'); } catch (e) {}
+          try { FS.mount(IDBFS, {}, '/locales'); } catch (e) {}
+
+          try { FS.mkdir('/tmp'); } catch (e) {}
+
+          FS.syncfs(true, function(err) {
+            if (err) {
+              console.error('[preRun] syncfs(true) failed:', err);
+              if (typeof removeRunDependency === 'function') {
+                removeRunDependency(dependencyId);
+              }
+              return;
+            }
+
+            Promise.resolve(ensureBootstrapAssets())
+              .catch(function(bootstrapErr) {
+                console.error('[preRun] ensureBootstrapAssets failed:', bootstrapErr);
+              })
+              .finally(function() {
+                if (typeof removeRunDependency === 'function') {
+                  removeRunDependency(dependencyId);
+                }
+              });
+          });
+        } catch (e) {
+          console.error('[preRun] Persistent filesystem init failed:', e);
+          if (typeof removeRunDependency === 'function') {
+            removeRunDependency(dependencyId);
+          }
+        }
+      }
+
+      Module.preRun.push(initializePersistentFsPreRun);
+
+      // Safe import invoker: retries until the wasm export is available
+      Module.safeInvokeImport = function(tempPath) {
+        var tries = 0;
+        function attempt() {
+          try {
+            if (typeof Module._OnEmscriptenImportSelected === 'function') {
+              var invoke = function() {
+                try {
+                  if (typeof Module.allocateUTF8 === 'function') {
+                    var ptr = Module.allocateUTF8(tempPath);
+                    Module._OnEmscriptenImportSelected(ptr);
+                  } else {
+                    Module._OnEmscriptenImportSelected(tempPath);
+                  }
+                } catch (invokeErr) {
+                  console.error('[safeInvokeImport] invoke error', invokeErr);
+                }
+              };
+              setTimeout(invoke, 0);
+              return;
+            }
+          } catch(e) { console.error('[safeInvokeImport] call error', e); }
+          tries++;
+          if (tries < 60) {
+            setTimeout(attempt, 200);
+          } else {
+            console.error('[safeInvokeImport] Failed to invoke wasm import callback for', tempPath);
+          }
+        }
+        attempt();
+      };
+
+      function getFs() {
+        return typeof FS !== 'undefined' ? FS : null;
+      }
+
+      function callExportedFunction(name, args) {
+        try {
+          const fn = Module && Module[name];
+          if (typeof fn === 'function') {
+            fn.apply(Module, args || []);
+            return true;
+          }
+        } catch (e) {}
+        return false;
+      }
+
+      const webFsSyncState = {
+        inFlight: false,
+        pending: false,
+        timer: null,
+      };
+
+      function syncPersistentFs(reason) {
+        const fs = getFs();
+        if (!fs || typeof fs.syncfs !== 'function') return;
+        if (webFsSyncState.inFlight) {
+          webFsSyncState.pending = true;
+          return;
+        }
+        webFsSyncState.inFlight = true;
+        fs.syncfs(false, function(err) {
+          if (err) {
+            console.error('[Web] syncfs(false) failed (' + reason + '):', err);
+          } else {
+            console.log('[Web] syncfs(false) complete (' + reason + ')');
+          }
+          webFsSyncState.inFlight = false;
+          if (webFsSyncState.pending) {
+            webFsSyncState.pending = false;
+            syncPersistentFs('pending');
+          }
+        });
+      }
+
+      function startPersistentFsAutosave() {
+        if (webFsSyncState.timer) return;
+        webFsSyncState.timer = setInterval(function() {
+          syncPersistentFs('autosave-5s');
+        }, 5000);
+        document.addEventListener('visibilitychange', function() {
+          if (document.visibilityState !== 'visible') {
+            syncPersistentFs('visibility-hidden');
+          }
+        });
+        window.addEventListener('pagehide', function() {
+          syncPersistentFs('pagehide');
+        });
+        window.addEventListener('beforeunload', function() {
+          syncPersistentFs('beforeunload');
+        });
+      }
+
+      function setStatus(message) {
+        document.getElementById('web-tools-msg').textContent = message;
+      }
+
+      let currentDir = '/models';
+
+      function joinPath(base, name) {
+        if (!base || base === '/') return '/' + name.replace(/^\/+/, '');
+        return (base.endsWith('/') ? base.slice(0, -1) : base) + '/' + name.replace(/^\/+/, '');
+      }
+
+      function currentSelectionPath() {
+        const sel = document.getElementById('modelsList');
+        if (!sel || !sel.value) return null;
+        const name = sel.value.endsWith('/') ? sel.value.slice(0, -1) : sel.value;
+        return joinPath(currentDir, name);
+      }
+
+      function updateBreadcrumb() {
+        const breadcrumb = document.getElementById('breadcrumb');
+        if (breadcrumb) breadcrumb.textContent = currentDir;
+      }
+
+      function populateModelsList() {
+        const fs = getFs();
+        const sel = document.getElementById('modelsList');
+        if (!fs || !sel) return;
+        sel.innerHTML = '';
+        updateBreadcrumb();
+        try {
+          const entries = fs.readdir(currentDir).filter(function(name) { return name !== '.' && name !== '..'; });
+          entries.sort(function(a, b) {
+            try {
+              const aStat = fs.stat(joinPath(currentDir, a));
+              const bStat = fs.stat(joinPath(currentDir, b));
+              const aDir = (aStat.mode & 0o170000) === 0o040000;
+              const bDir = (bStat.mode & 0o170000) === 0o040000;
+              if (aDir !== bDir) return aDir ? -1 : 1;
+            } catch (e) {}
+            return a.localeCompare(b);
+          });
+          for (const entry of entries) {
+            try {
+              const stat = fs.stat(joinPath(currentDir, entry));
+              const opt = document.createElement('option');
+              opt.value = (stat.mode & 0o170000) === 0o040000 ? entry + '/' : entry;
+              opt.textContent = opt.value;
+              sel.appendChild(opt);
+            } catch (e) {}
+          }
+        } catch (e) {
+          console.warn('populateModelsList error', e);
+        }
+      }
+
+      async function uploadFiles(files) {
+        const fs = getFs();
+        if (!fs) return;
+        setStatus('Uploading ' + files.length + ' file(s) to /models...');
+        let fileCount = 0;
+        for (const f of files) {
+          let rel = f.webkitRelativePath || f.name;
+          if (f.webkitRelativePath) {
+            const parts = rel.split('/').filter(Boolean);
+            rel = parts.length > 1 ? parts.slice(1).join('/') : (parts[0] || f.name);
+          }
+          if (rel.startsWith('./')) rel = rel.slice(2);
+          const parts = rel.split('/').filter(Boolean);
+          let dir = '/models';
+          for (let i = 0; i < parts.length - 1; ++i) {
+            dir = joinPath(dir, parts[i]);
+            try { fs.mkdir(dir); } catch(e) {}
+          }
+          const outPath = joinPath('/models', rel);
+          try {
+            const buf = new Uint8Array(await f.arrayBuffer());
+            fs.writeFile(outPath, buf);
+            fileCount++;
+          } catch(e) {
+            console.error('Write error for ' + outPath + ':', e);
+          }
+        }
+        syncPersistentFs('file-manager-upload-models');
+        setStatus('Uploaded ' + fileCount + ' file(s)');
+        populateModelsList();
+        callExportedFunction('_WebReloadStartupUi', []);
+      }
+
+      async function uploadFilesToCurrent(files, preserveStructure, includeTopFolder) {
+        const fs = getFs();
+        if (!fs) return;
+        setStatus('Uploading ' + files.length + ' file(s) to current folder...');
+        let fileCount = 0;
+        for (const f of files) {
+          let rel = preserveStructure ? (f.webkitRelativePath || f.name) : f.name;
+          if (preserveStructure) {
+            const parts = rel.split('/').filter(Boolean);
+            if (includeTopFolder) {
+              rel = parts.join('/') || f.name;
+            } else if (parts.length > 1) {
+              rel = parts.slice(1).join('/');
+            } else {
+              rel = parts[0] || f.name;
+            }
+          }
+          if (rel.startsWith('./')) rel = rel.slice(2);
+          const parts = rel.split('/').filter(Boolean);
+          let dir = currentDir;
+          for (let i = 0; i < parts.length - 1; ++i) {
+            dir = joinPath(dir, parts[i]);
+            try { fs.mkdir(dir); } catch(e) {}
+          }
+          const outPath = joinPath(currentDir, rel);
+          try {
+            const buf = new Uint8Array(await f.arrayBuffer());
+            fs.writeFile(outPath, buf);
+            fileCount++;
+          } catch(e) {
+            console.error('Write error for ' + outPath + ':', e);
+          }
+        }
+        syncPersistentFs('file-manager-upload-current');
+        setStatus('Uploaded ' + fileCount + ' file(s)');
+        populateModelsList();
+        callExportedFunction('_WebReloadStartupUi', []);
+      }
+
+      function rmTree(path) {
+        const fs = getFs();
+        if (!fs) return;
+        try {
+          const items = fs.readdir(path);
+          for (const it of items) {
+            if (it === '.' || it === '..') continue;
+            const p = joinPath(path, it);
+            const stat = fs.stat(p);
+            if (stat && (stat.mode & 0o170000) === 0o040000) {
+              rmTree(p);
+            } else {
+              try { fs.unlink(p); } catch(e) { console.warn(e); }
+            }
+          }
+          fs.rmdir(path);
+        } catch(e) {
+          console.warn('rmTree error', e);
+        }
+      }
+
+      function goUpDirectory() {
+        if (currentDir === '/' || currentDir === '/models') {
+          currentDir = '/';
+        } else {
+          const parts = currentDir.split('/').filter(Boolean);
+          parts.pop();
+          currentDir = '/' + parts.join('/');
+        }
+        populateModelsList();
+      }
+
+      function openSelected() {
+        const fs = getFs();
+        const path = currentSelectionPath();
+        if (!fs || !path) return;
+        try {
+          const stat = fs.stat(path);
+          if ((stat.mode & 0o170000) === 0o040000) {
+            currentDir = path;
+            populateModelsList();
+          } else {
+            editSelected();
+          }
+        } catch (e) {
+          setStatus('Open failed: ' + e);
+        }
+      }
+
+      function createNewFolder() {
+        const fs = getFs();
+        const name = prompt('Folder name:');
+        if (!fs || !name) return;
+        try {
+          fs.mkdir(joinPath(currentDir, name));
+          syncPersistentFs('file-manager-create-folder');
+          populateModelsList();
+        } catch (e) {
+          setStatus('Create folder failed: ' + e);
+        }
+      }
+
+      function renameSelected() {
+        const fs = getFs();
+        const path = currentSelectionPath();
+        if (!fs || !path) return;
+        const newName = prompt('Rename to:', document.getElementById('modelsList').value.replace(/\/$/, ''));
+        if (!newName) return;
+        try {
+          const nextPath = joinPath(currentDir, newName);
+          fs.rename(path, nextPath);
+          syncPersistentFs('file-manager-rename');
+          populateModelsList();
+        } catch (e) {
+          setStatus('Rename failed: ' + e);
+        }
+      }
+
+      function moveSelected() {
+        const fs = getFs();
+        const path = currentSelectionPath();
+        if (!fs || !path) return;
+        const destination = prompt('Move to path:', currentDir);
+        if (!destination) return;
+        const target = joinPath(destination, document.getElementById('modelsList').value.replace(/\/$/, ''));
+        try {
+          fs.rename(path, target);
+          syncPersistentFs('file-manager-move');
+          populateModelsList();
+        } catch (e) {
+          setStatus('Move failed: ' + e);
+        }
+      }
+
+      async function deleteSelected() {
+        const fs = getFs();
+        const path = currentSelectionPath();
+        if (!fs || !path) return;
+        if (!confirm('Delete ' + path + '?')) return;
+        try {
+          const stat = fs.stat(path);
+          if (stat && (stat.mode & 0o170000) === 0o040000) rmTree(path);
+          else fs.unlink(path);
+          syncPersistentFs('file-manager-delete');
+          setStatus('Deleted ' + path);
+          populateModelsList();
+          callExportedFunction('_WebReloadStartupUi', []);
+        } catch (e) {
+          setStatus('Delete failed: ' + e);
+        }
+      }
+
+      function downloadBlob(blob, filename) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      }
+
+      function writeString(buffer, offset, str, length) {
+        for (let i = 0; i < length; i++) {
+          buffer[offset + i] = i < str.length ? str.charCodeAt(i) : 0;
+        }
+      }
+
+      function writeOctal(buffer, offset, value, length) {
+        const text = value.toString(8).padStart(length - 1, '0') + '\0';
+        writeString(buffer, offset, text, length);
+      }
+
+      function makeTarHeader(name, size) {
+        const header = new Uint8Array(512);
+        writeString(header, 0, name, 100);
+        writeOctal(header, 100, 0o644, 8);
+        writeOctal(header, 108, 0, 8);
+        writeOctal(header, 116, 0, 8);
+        writeOctal(header, 124, size, 12);
+        writeOctal(header, 136, Math.floor(Date.now() / 1000), 12);
+        for (let i = 148; i < 156; i++) header[i] = 32;
+        header[156] = 0;
+        writeString(header, 257, 'ustar\0', 8);
+        writeString(header, 263, '00', 2);
+        writeString(header, 265, 'root', 32);
+        writeString(header, 297, 'root', 32);
+        let sum = 0;
+        for (let i = 0; i < 512; i++) sum += header[i];
+        writeOctal(header, 148, sum, 8);
+        return header;
+      }
+
+      function padTo512(data) {
+        if (data.length % 512 === 0) return data;
+        const pad = 512 - (data.length % 512);
+        const out = new Uint8Array(data.length + pad);
+        out.set(data, 0);
+        return out;
+      }
+
+      function collectFiles(dir, baseName, list) {
+        const fs = getFs();
+        if (!fs) return;
+        const items = fs.readdir(dir);
+        for (const name of items) {
+          if (name === '.' || name === '..') continue;
+          const fullPath = dir + '/' + name;
+          const stat = fs.stat(fullPath);
+          const entryName = baseName ? baseName + '/' + name : name;
+          if (stat && (stat.mode & 0o170000) === 0o040000) {
+            collectFiles(fullPath, entryName, list);
+          } else {
+            list.push({ path: fullPath, name: entryName, size: stat.size });
+          }
+        }
+      }
+
+      function createTarFromDirectory(dirPath, rootName) {
+        const fs = getFs();
+        const files = [];
+        collectFiles(dirPath, '', files);
+        const parts = [];
+        for (const file of files) {
+          const header = makeTarHeader(rootName + '/' + file.name, file.size);
+          parts.push(header);
+          const data = fs.readFile(file.path, { encoding: 'binary' });
+          parts.push(padTo512(data));
+        }
+        parts.push(new Uint8Array(512));
+        parts.push(new Uint8Array(512));
+        const totalSize = parts.reduce((sum, part) => sum + part.length, 0);
+        const tar = new Uint8Array(totalSize);
+        let offset = 0;
+        for (const part of parts) {
+          tar.set(part, offset);
+          offset += part.length;
+        }
+        return new Blob([tar], { type: 'application/x-tar' });
+      }
+
+      async function downloadSelected() {
+        const fs = getFs();
+        if (!fs) return;
+        const path = currentSelectionPath();
+        const sel = document.getElementById('modelsList');
+        if (!path || !sel || !sel.value) { setStatus('No selection'); return; }
+        try {
+          const stat = fs.stat(path);
+          const displayName = sel.value.replace(/\/$/, '');
+          if (stat && (stat.mode & 0o170000) === 0o040000) {
+            setStatus('Preparing archive...');
+            const blob = createTarFromDirectory(path, displayName);
+            downloadBlob(blob, displayName + '.tar');
+            setStatus('Downloaded archive: ' + displayName + '.tar');
+          } else {
+            const data = fs.readFile(path, { encoding: 'binary' });
+            downloadBlob(new Blob([data], { type: 'application/octet-stream' }), displayName);
+            setStatus('Downloaded file: ' + displayName);
+          }
+        } catch(e) {
+          setStatus('Download failed: ' + e);
+        }
+      }
+
+
+      async function ensureBootstrapAssets() {
+        const fs = getFs(); 
+        if (!fs) { 
+          console.error('[ensureBootstrapAssets] FS not available'); 
+          return false; 
+        }
+        let restored = false;
+
+        async function ensureFile(targetPath, candidates, label) {
+          try {
+            if (fs.analyzePath(targetPath).exists) {
+              return false;
+            }
+          } catch (e) {}
+          for (const candidate of candidates) {
+            console.log('[ensureBootstrapAssets] Fetching ' + label + ' from ' + candidate);
+            if (await fetchAndRestoreFileSync(candidate, targetPath)) {
+              console.log('[ensureBootstrapAssets] Restored ' + label + ' to ' + targetPath);
+              return true;
+            }
+          }
+          console.warn('[ensureBootstrapAssets] Missing ' + label + ' and could not restore it');
+          return false;
+        }
+
+        restored = await ensureFile('/locales/roms.db', ['roms.db', './roms.db', 'build-web/CasioEmuMsvc/roms.db'], 'roms.db') || restored;
+        restored = await ensureFile('/locales/CONSOLA.TTF', ['CONSOLA.TTF', './CONSOLA.TTF', 'build-web/CasioEmuMsvc/CONSOLA.TTF'], 'CONSOLA.TTF') || restored;
+
+        try {
+          await loadLocales();
+        } catch (e) {
+          console.warn('[ensureBootstrapAssets] Locale restore failed', e);
+        }
+
+        syncPersistentFs('ensure-bootstrap-assets');
+
+        return restored;
+      }
+
+      async function loadLocales() {
+        const fs = getFs();
+        if (!fs) return;
+        setStatus('Loading locales...');
+        const names = ['en_US.lc','ja_JP.lc','vi_VN.lc','zh_CN.lc'];
+        const bases = ['locales/','./locales/','../locales/'];
+        try { fs.mkdir('/locales'); } catch(e) {}
+        for (const name of names) {
+          let found = false;
+          for (const base of bases) {
+            try {
+              const res = await fetch(base + name);
+              if (res.ok) {
+                const data = new Uint8Array(await res.arrayBuffer());
+                try { fs.writeFile('/locales/' + name, data); } catch(e) {}
+                found = true;
+                console.log('Loaded locale:', base + name);
+                break;
+              }
+            } catch(e) {}
+          }
+          if (!found) console.warn('Locale not found:', name);
+        }
+        syncPersistentFs('load-locales');
+        setStatus('Locales loaded');
+      }
+
+      let eventListenersInitialized = false;
+
+      function setupEventListeners() {
+        if (eventListenersInitialized) return;
+        const canvas = document.getElementById('canvas');
+        const webTools = document.getElementById('web-tools');
+        const toggleBtn = document.getElementById('toggleToolsBtn');
+        const body = document.getElementById('web-tools-body');
+        const toolsTitle = document.getElementById('toolsTitle');
+
+        if (!canvas || !webTools || !toggleBtn || !body) return;
+        eventListenersInitialized = true;
+
+        // Ensure canvas can receive focus and keyboard input.
+        canvas.tabIndex = 1;
+        canvas.style.outline = 'none';
+
+        function setCalculatorFocus(enabled) {
+          callExportedFunction('_SetWebFocusCalculator', [enabled ? 1 : 0]);
+        }
+
+        function focusCalculator() {
+          setCalculatorFocus(true);
+          canvas.focus({ preventScroll: true });
+        }
+
+        function releaseCalculatorFocus() {
+          setCalculatorFocus(false);
+        }
+
+        function updateFocusFromCanvasPointer(event) {
+          const hitTest = callExportedFunction('_WebCalculatorHitTest', [Math.floor(event.offsetX), Math.floor(event.offsetY)]);
+          if (hitTest) {
+            focusCalculator();
+            console.log('[Keyboard] Canvas pointerdown - calculator focus requested');
+          } else {
+            releaseCalculatorFocus();
+            console.log('[Keyboard] Canvas pointerdown - debugger focus requested');
+          }
+        }
+
+        document.getElementById('uploadCurrent').addEventListener('change', function(e) {
+          uploadFilesToCurrent(e.target.files, false, false);
+          releaseCalculatorFocus();
+        });
+
+        document.getElementById('btnUploadFolder').addEventListener('click', function() {
+          document.getElementById('uploadFolder').click();
+        });
+        document.getElementById('uploadFolder').addEventListener('change', function(e) {
+          // Keep the selected top-level folder name when uploading a folder.
+          uploadFilesToCurrent(e.target.files, true, true);
+          releaseCalculatorFocus();
+        });
+
+        document.getElementById('btnUploadModels').addEventListener('click', function() {
+          document.getElementById('uploadModelsFolder').click();
+        });
+        document.getElementById('uploadModelsFolder').addEventListener('change', function(e) {
+          uploadFiles(e.target.files);
+          releaseCalculatorFocus();
+        });
+
+        document.getElementById('upBtn').addEventListener('click', function() {
+          goUpDirectory();
+          releaseCalculatorFocus();
+        });
+        document.getElementById('refreshBtn').addEventListener('click', function() {
+          populateModelsList();
+          releaseCalculatorFocus();
+        });
+        document.getElementById('openBtn').addEventListener('click', function() {
+          openSelected();
+          releaseCalculatorFocus();
+        });
+        document.getElementById('newFolderBtn').addEventListener('click', function() {
+          createNewFolder();
+          releaseCalculatorFocus();
+        });
+        document.getElementById('renameBtn').addEventListener('click', function() {
+          renameSelected();
+          releaseCalculatorFocus();
+        });
+        document.getElementById('moveBtn').addEventListener('click', function() {
+          moveSelected();
+          releaseCalculatorFocus();
+        });
+        document.getElementById('deleteBtn').addEventListener('click', function() {
+          deleteSelected();
+          releaseCalculatorFocus();
+        });
+        document.getElementById('downloadBtn').addEventListener('click', function() {
+          downloadSelected();
+          releaseCalculatorFocus();
+        });
+        document.getElementById('loadLocalesBtn').addEventListener('click', function() {
+          loadLocales();
+          releaseCalculatorFocus();
+        });
+
+        // When clicking the canvas, tell the wasm side to route keyboard to calculator.
+        canvas.addEventListener('pointerdown', function(event) {
+          updateFocusFromCanvasPointer(event);
+        });
+
+        // When interacting with the web-tools panel, prefer debugger/UI focus.
+        webTools.addEventListener('pointerdown', function() {
+          releaseCalculatorFocus();
+          console.log('[Keyboard] Web tools pointerdown - calculator focus released');
+        });
+
+        webTools.addEventListener('click', function() {
+          releaseCalculatorFocus();
+          console.log('[Keyboard] Web tools clicked - calculator focus released');
+        });
+
+        body.style.display = 'block';
+        toggleBtn.textContent = '▲';
+        toggleBtn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          releaseCalculatorFocus();
+          const isVisible = body.style.display !== 'none';
+          console.log('[Toggle] Click. Current visible:', isVisible);
+
+          if (isVisible) {
+            body.style.display = 'none';
+            toolsTitle.textContent = '';
+            toggleBtn.textContent = '▼';
+            console.log('[Toggle] Panel hidden');
+          } else {
+            body.style.display = 'block';
+            toolsTitle.textContent = 'File Manager';
+            toggleBtn.textContent = '▲';
+            console.log('[Toggle] Panel shown');
+          }
+        });
+
+        // Clicking anywhere outside the calculator should release calculator keyboard focus.
+        document.addEventListener('click', function(e) {
+          if (e.target !== canvas && !e.target.closest('#web-tools-body')) {
+            releaseCalculatorFocus();
+          }
+        });
+
+        focusCalculator();
+      }
+
+      function trySetupEventListeners() {
+        setupEventListeners();
+        return eventListenersInitialized;
+      }
+
+      if (!trySetupEventListeners()) {
+        document.addEventListener('DOMContentLoaded', trySetupEventListeners);
+      }
+
+      window.addEventListener('load', function() {
+        trySetupEventListeners();
+        const canvas = document.getElementById('canvas');
+        if (canvas) canvas.focus({ preventScroll: true });
+      });
+
+      Module['onRuntimeInitialized'] = async function() {
+        console.log('[Web] Module initialized');
+        const canvas = document.getElementById('canvas');
+        if (canvas) canvas.focus({ preventScroll: true });
+        try {
+          startPersistentFsAutosave();
+          callExportedFunction('_WebReloadStartupUi', []);
+          console.log('[Web] Populating models list...');
+          populateModelsList();
+          document.getElementById('canvas').focus();
+        } catch(e) {
+          console.error('[Web] onRuntimeInitialized error:', e);
+          populateModelsList();
+          document.getElementById('canvas').focus();
+        }
+      };
+    </script>
+    <!-- Load StartupUI - the main entry point with calculator and debugger launchers -->
+    <script src="CasioEmu.js?v=7"></script>
+  </body>
+</html>
